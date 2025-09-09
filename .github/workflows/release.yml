@@ -1,0 +1,148 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'The name of the release (e.g., v0.1.0)'
+        required: false
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  crate_metadata:
+    name: Extract crate metadata
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.crate_metadata.outputs.name }}
+      version: ${{ steps.crate_metadata.outputs.version }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Extract crate information
+      id: crate_metadata
+      run: |
+        CRATE_NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].name')
+        CRATE_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+        echo "name=${CRATE_NAME}" | tee -a $GITHUB_OUTPUT
+        echo "version=${CRATE_VERSION}" | tee -a $GITHUB_OUTPUT
+
+  build_and_package:
+    name: Build for ${{ matrix.target }}
+    needs: crate_metadata
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-14 # For aarch64
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Set binary and package names
+        id: names
+        shell: bash
+        run: |
+          EXE_SUFFIX=""
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            EXE_SUFFIX=".exe"
+          fi
+          
+          PKG_SUFFIX=".tar.gz"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            PKG_SUFFIX=".zip"
+          fi
+
+          CRATE_NAME="${{ needs.crate_metadata.outputs.name }}"
+          CRATE_VERSION="${{ needs.crate_metadata.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          
+          BIN_NAME="${CRATE_NAME}${EXE_SUFFIX}"
+          PKG_BASENAME="${CRATE_NAME}-v${CRATE_VERSION}-${TARGET}"
+          PKG_NAME="${PKG_BASENAME}${PKG_SUFFIX}"
+
+          echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_OUTPUT
+          echo "PKG_BASENAME=${PKG_BASENAME}" >> $GITHUB_OUTPUT
+          echo "PKG_NAME=${PKG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          STAGING_DIR="staging"
+          ARCHIVE_DIR="${STAGING_DIR}/${{ steps.names.outputs.PKG_BASENAME }}"
+          mkdir -p "${ARCHIVE_DIR}"
+
+          # Copy binary
+          cp "target/${{ matrix.target }}/release/${{ steps.names.outputs.BIN_NAME }}" "${ARCHIVE_DIR}/"
+
+          # Copy documentation
+          cp "README.md" "${ARCHIVE_DIR}/"
+
+          # Create archive
+          pushd "${STAGING_DIR}" >/dev/null
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a "../${{ steps.names.outputs.PKG_NAME }}" "./${{ steps.names.outputs.PKG_BASENAME }}"
+          else
+            tar -czf "../${{ steps.names.outputs.PKG_NAME }}" "./${{ steps.names.outputs.PKG_BASENAME }}"
+          fi
+          popd >/dev/null
+          
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.PKG_NAME }}
+          path: ${{ steps.names.outputs.PKG_NAME }}
+
+  release:
+    name: Create Release
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: [crate_metadata, build_and_package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set release version
+        id: release_version
+        run: |
+          if [[ -n "${{ github.event.inputs.release_name }}" ]]; then
+            echo "VERSION=${{ github.event.inputs.release_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "VERSION=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=v${{ needs.crate_metadata.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_version.outputs.VERSION }}
+          name: ${{ steps.release_version.outputs.VERSION }}
+          files: artifacts/*/*
+          body: "Automated release of cross-platform binaries."
+          prerelease: false
